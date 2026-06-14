@@ -20,7 +20,7 @@ writes the two hook entries into **this project's** `.claude/settings.json`.
 Run inside the target project directory. Exactly three things, all local:
 
 1. **Creates the graph** at `./.fg/` (unless one already exists):
-   `project.json`, `facts/goal.json`, and the `intents/` `hints/` `runs/` dirs.
+   `project.json`, `facts/goal.json`, and the `intents/` `hints/` dirs.
 2. **Registers hooks** in `./.claude/settings.json` — `SessionStart` and
    `UserPromptSubmit`, both pointing at `fg-hook.py`. These inject the current
    graph state into every turn so the model always knows the frontier. This is

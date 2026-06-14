@@ -42,7 +42,6 @@ your-project/
 │   ├── facts/{goal,f001,…}.json
 │   ├── intents/i001.json …
 │   ├── hints/
-│   └── runs/                 # dispatch execution log
 └── AGENTS.md                 # (optional) protocol for dispatched agents
 ```
 
@@ -127,7 +126,7 @@ existence = dependency satisfied), and it isn't awaiting confirmation.
 fgc init --goal "reproduce the empty-token crash"           # create .fg/
 fgc setup --goal "..." --agents                             # opt-in THIS project (hooks + graph)
 fgc status                                                  # project + frontier
-fgc graph [--format mermaid|json]                           # full graph
+fgc graph [--format text|json]                               # full graph
 fgc frontier                                                # ready intents only
 fgc pick [--claim]                                          # next intent id
 fgc view [--serve]                                          # open the HTML visualization
@@ -253,7 +252,7 @@ placeholders: `{origin}`, `{goal}`, `{graph_yaml}`, `{fact_ids}`,
 
 - Storage + locking: `lib/fg.py` → `Store`, `atomic_write_json`, `Store.locked`
 - Graph queries: `build_graph_view`, `frontier`, `is_ready`
-- Renderers: `render_status`, `render_graph_text`, `render_mermaid`, `render_prompt`
+- Renderers: `render_status`, `render_graph_text`, `render_prompt`
 - Dispatch: `cmd_dispatch`, `run_claude`, `_apply_reason`, `_parse_explore_payload`
 - Auto-loop driver: `cmd_auto`, `_run_reason_raw`, `_run_explore_raw`, `_run_verify_raw`
 - LLM-output parsing (tolerant of surrounding prose): `extract_json_object`

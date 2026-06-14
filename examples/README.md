@@ -17,7 +17,7 @@ fgc init --origin "user report: segfault" --goal "find root cause of segfault in
 
 # 2. see it
 fgc status
-fgc graph --format mermaid   # paste into a mermaid viewer if you like
+fgc graph                    # full graph as text
 
 # 3. commander proposes the first intents (DRY RUN first to see the prompt)
 fgc dispatch reason --dry-run

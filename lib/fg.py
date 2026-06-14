@@ -57,7 +57,6 @@ class Store:
         self.facts_dir = root / "facts"
         self.intents_dir = root / "intents"
         self.hints_dir = root / "hints"
-        self.runs_dir = root / "runs"
         self.project_file = root / "project.json"
         self.lock_file = root / LOCK_NAME
 
@@ -76,7 +75,7 @@ class Store:
     def init(self, origin: str, goal: str) -> None:
         if self.exists():
             raise FGError(f"fact graph already exists at {self.root}")
-        for d in (self.root, self.facts_dir, self.intents_dir, self.hints_dir, self.runs_dir):
+        for d in (self.root, self.facts_dir, self.intents_dir, self.hints_dir):
             d.mkdir(parents=True, exist_ok=True)
         project = {
             "id": "proj",
@@ -307,33 +306,6 @@ class Store:
             atomic_write_json(self.hints_dir / f"{hid}.json", hint)
             return hint
 
-    # -- runs (execution log) --
-    def add_run(self, kind: str, intent_id: str | None, worker: str) -> dict:
-        with self.locked():
-            rid = self._next_id("run", "r")
-            run = {
-                "id": rid,
-                "kind": kind,
-                "intent_id": intent_id,
-                "worker": worker,
-                "started_at": now_iso(),
-                "finished_at": None,
-                "result": None,
-            }
-            atomic_write_json(self.runs_dir / f"{rid}.json", run)
-            return run
-
-    def finish_run(self, rid: str, result: str) -> dict:
-        with self.locked():
-            p = self.runs_dir / f"{rid}.json"
-            if not p.exists():
-                raise FGError(f"run {rid} not found")
-            run = read_json(p)
-            run["finished_at"] = now_iso()
-            run["result"] = result
-            atomic_write_json(p, run)
-            return run
-
 
 # --------------------------------------------------------------------------- #
 # low-level io
@@ -482,32 +454,6 @@ def render_graph_text(store: Store) -> str:
         lines.append("## hints")
         for h in g["hints"]:
             lines.append(f"  {h['id']} ({h['creator']}): {h['content']}")
-    return "\n".join(lines)
-
-
-def render_mermaid(store: Store) -> str:
-    g = build_graph_view(store)
-    lines = ["flowchart TD"]
-    def _mermaid_label(raw: str, n: int) -> str:
-        # strip chars mermaid treats specially in labels, then truncate
-        s = (raw or "").replace('"', "'").replace("[", "(").replace("]", ")")
-        s = s.replace("{", "(").replace("}", ")").replace("#", "")
-        return s[:n] + ("..." if len(s) > n else "")
-    # facts as nodes
-    for f in g["facts"]:
-        label = _mermaid_label(f["description"], 57)
-        shape = "(())" if f["id"] == GOAL_ID else "[]"
-        lines.append(f'  {f["id"]}{shape}["{f["id"]}: {label}"]')
-    # intents as edges
-    for i in g["intents"]:
-        label = _mermaid_label(i["description"], 37)
-        style = "-->" if i["to"] else "-.->"
-        # '?' is not a valid mermaid node id (review M3) -> use 'open'
-        target = i["to"] or "open"
-        lines.append(f'  {i["id"]}_{target}{{"{i["id"]}"}}')
-        for src in i["from"]:
-            lines.append(f"  {src} {style} {i['id']}_{target}")
-        lines.append(f'  {i["id"]}_{target} {style} {target}')
     return "\n".join(lines)
 
 
@@ -758,9 +704,7 @@ def cmd_status(args) -> int:
 def cmd_graph(args) -> int:
     store = Store(Path(args.store))
     store.require()
-    if args.format == "mermaid":
-        print(render_mermaid(store))
-    elif args.format == "json":
+    if args.format == "json":
         print(json.dumps(build_graph_view(store), ensure_ascii=False, indent=2))
     else:
         print(render_graph_text(store))
@@ -973,7 +917,6 @@ def _dispatch_reason(store, templates_dir, model, timeout, skip, cwd, args) -> i
     if args.dry_run:
         print(prompt)
         return 0
-    run = store.add_run("reason", None, _worker_id(model))
     envelope = run_claude(
         prompt,
         model=model, timeout=timeout, skip_permissions=skip,
@@ -983,7 +926,6 @@ def _dispatch_reason(store, templates_dir, model, timeout, skip, cwd, args) -> i
     payload = extract_json_object(text)
     kind, data = _classify_reason_payload(payload)
     summary = _apply_reason(store, kind, data)
-    store.finish_run(run["id"], json.dumps({"kind": kind, "summary": summary}, ensure_ascii=False))
     print(f"[reason] {summary}")
     return 0
 
@@ -1018,7 +960,6 @@ def _dispatch_explore(store, templates_dir, intent, model, timeout, skip, cwd, a
         return 0
     if args.claim:
         store.claim_intent(intent["id"], worker)
-    run = store.add_run("explore", intent["id"], worker)
     envelope = run_claude(
         prompt,
         model=model, timeout=timeout, skip_permissions=skip,
@@ -1032,7 +973,6 @@ def _dispatch_explore(store, templates_dir, intent, model, timeout, skip, cwd, a
     fact, intent = store.conclude_with_new_fact(
         intent["id"], desc, worker, title=title,
     )
-    store.finish_run(run["id"], json.dumps({"fact": fact["id"], "title": title, "desc": desc}, ensure_ascii=False))
     print(f"[explore] {intent['id']} -> {fact['id']}: {desc}")
     return 0
 
@@ -1052,7 +992,6 @@ def _dispatch_verify(store, templates_dir, model, timeout, skip, cwd, args) -> i
     if args.dry_run:
         print(prompt)
         return 0
-    run = store.add_run("verify", intent["id"], _worker_id(model))
     envelope = run_claude(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
@@ -1060,10 +999,6 @@ def _dispatch_verify(store, templates_dir, model, timeout, skip, cwd, args) -> i
     text = envelope.get("result", "")
     payload = extract_json_object(text)
     verified, issues = _parse_verify_payload(payload)
-    store.finish_run(
-        run["id"],
-        json.dumps({"verified": verified, "issues": issues}, ensure_ascii=False),
-    )
     tag = "VERIFIED" if verified else "FAILED"
     print(f"[verify] {args.intent}: {tag}" + (f" — {issues}" if issues else ""))
     return 0
@@ -1169,19 +1104,6 @@ def _parse_verify_payload(payload: dict) -> tuple[bool, str]:
         raise FGError("verify payload missing boolean 'verified'")
     issues = data.get("issues", "") or ""
     return verified, str(issues)
-
-
-def cmd_scaffold(args) -> int:
-    """Drop an AGENTS.md spec into the project so dispatched agents know the protocol."""
-    store = Store(Path(args.store))
-    store.require()
-    target = Path(args.path)
-    if target.exists() and not args.force:
-        raise FGError(f"{target} exists; use --force to overwrite")
-    spec = _AGENTS_SPEC.format(store=str(store.root.resolve()))
-    target.write_text(spec, encoding="utf-8")
-    print(f"wrote {target}")
-    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1585,7 +1507,6 @@ def _run_reason_raw(store, templates_dir, model, timeout, skip, cwd) -> tuple[st
     """Like _dispatch_reason but returns (kind, summary) instead of printing."""
     tpl = _load_template(templates_dir, "reason.md")
     prompt = render_prompt(store, tpl)
-    run = store.add_run("reason", None, _worker_id(model))
     envelope = run_claude(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
@@ -1593,7 +1514,6 @@ def _run_reason_raw(store, templates_dir, model, timeout, skip, cwd) -> tuple[st
     payload = extract_json_object(envelope.get("result", ""))
     kind, data = _classify_reason_payload(payload)
     summary = _apply_reason(store, kind, data)
-    store.finish_run(run["id"], json.dumps({"kind": kind, "summary": summary}, ensure_ascii=False))
     return kind, summary
 
 
@@ -1605,7 +1525,6 @@ def _run_explore_raw(store, templates_dir, intent, model, timeout, skip, cwd, cl
     prompt = render_intent_prompt(store, tpl, intent)
     if claim:
         store.claim_intent(intent["id"], worker)
-    run = store.add_run("explore", intent["id"], worker)
     envelope = run_claude(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=_agents_system_prompt(store), cwd=cwd,
@@ -1614,7 +1533,6 @@ def _run_explore_raw(store, templates_dir, intent, model, timeout, skip, cwd, cl
     title, desc = _parse_explore_payload(payload)
     # atomic fact-create + conclude: no orphan if a concurrent executor won (C1/H1)
     fact, _ = store.conclude_with_new_fact(intent["id"], desc, worker, title=title)
-    store.finish_run(run["id"], json.dumps({"fact": fact["id"], "desc": desc}, ensure_ascii=False))
     return fact
 
 
@@ -1625,14 +1543,12 @@ def _run_verify_raw(store, templates_dir, intent, model, timeout, skip, cwd) -> 
         tpl.replace("{intent_description}", intent["description"])
         .replace("{result_description}", fact["description"])
     )
-    run = store.add_run("verify", intent["id"], _worker_id(model))
     envelope = run_claude(
         prompt, model=model, timeout=timeout, skip_permissions=skip,
         append_system=None, cwd=cwd,
     )
     payload = extract_json_object(envelope.get("result", ""))
     verified, issues = _parse_verify_payload(payload)
-    store.finish_run(run["id"], json.dumps({"verified": verified, "issues": issues}, ensure_ascii=False))
     return verified, issues
 
 
@@ -1700,7 +1616,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_status)
 
     sp = sub.add_parser("graph", help="dump the graph")
-    sp.add_argument("--format", choices=["text", "mermaid", "json"], default="text")
+    sp.add_argument("--format", choices=["text", "json"], default="text")
     sp.set_defaults(func=cmd_graph)
 
     sp = sub.add_parser("frontier", help="open intents ready to work")
@@ -1782,11 +1698,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--claim", action="store_true", help="(explore) claim the intent first")
     sp.add_argument("--intent", default=None, help="(verify) intent id to verify")
     sp.set_defaults(func=cmd_dispatch)
-
-    sp = sub.add_parser("scaffold", help="write AGENTS.md so dispatched agents know the protocol")
-    sp.add_argument("--path", default="AGENTS.md")
-    sp.add_argument("--force", action="store_true")
-    sp.set_defaults(func=cmd_scaffold)
 
     sp = sub.add_parser(
         "setup",
