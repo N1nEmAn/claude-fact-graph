@@ -10,12 +10,16 @@ commander through the `fgc` CLI:
 
 ```
 fgc status                     # project state + what is ready
-fgc graph                      # full graph
-fgc show fact <id>             # detail on a fact
+fgc graph                      # full graph (titles + one-line summaries)
+fgc show fact <id>             # full node detail incl. title/description/doc
+fgc doc <id>                   # read the detailed doc of a fact/intent (READ THIS when you need depth)
 fgc fact "<observation>"       # record something you just confirmed
 fgc done <intent-id> --fact "<result>"   # finish THIS intent with a fact
 fgc hint "<note>"              # leave a note for the commander / human
 ```
+
+When the Current Intent or its source facts have a `doc`, READ it with `fgc doc <id>`
+before starting — it carries the detailed context the summary left out.
 
 # Output Requirements
 Return ONE raw JSON object and nothing else. The JSON must be valid.
@@ -27,12 +31,13 @@ Reject only when execution is clearly inappropriate:
 
 Normal return — the incremental fact this intent produced:
 ```json
-{"accepted": true, "data": {"title": "中间件已修复", "description": "what you confirmed, with evidence"}}
+{"accepted": true, "data": {"title": "中间件已修复", "description": "one-sentence gist of what you confirmed", "doc": "optional detailed markdown: exact commands run, output, changed files, evidence"}}
 ```
 
-**`title`** is REQUIRED — a short (2–10 字) human-readable label in the SAME language
-as the goal (中文 goal → 中文 title). It is the node label in the graph view. Keep it
-concrete: "已复现崩溃", "空指针定位", "补丁已验证". Never paste the description into it.
+Each node has THREE documentation layers — use them correctly:
+- **`title`** (REQUIRED) — a short (2–10 字) human-readable label in the SAME language as the goal (中文 goal → 中文 title). The node label in the graph view. Concrete: "已复现崩溃", "空指针定位", "补丁已验证". Never paste the description into it.
+- **`description`** (REQUIRED) — a ONE-sentence gist / summary of the confirmed result, WITH the key evidence inline. Shown in `fgc graph` and injected into prompts by default.
+- **`doc`** (OPTIONAL, recommended for non-trivial results) — detailed markdown documentation: the full command(s) you ran and their output, changed file paths, verification steps, constraints, gotchas. Read by the next agent via `fgc doc <id>` only when it needs the detail. Put the long evidence here, NOT in description.
 
 # Rules
 - Stay scoped to the Current Intent. Do not solve unrelated parts unless they

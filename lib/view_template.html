@@ -322,6 +322,16 @@ function render(g){
       dt.textContent = trunc(f.description||"",30);
     }
     g2.appendChild(dt);
+    // doc badge: a small 📄 in the top-right corner when the node has a detailed doc
+    if(f.doc){
+      const badge=document.createElementNS("http://www.w3.org/2000/svg","text");
+      badge.setAttribute("x",196); badge.setAttribute("y",18);
+      badge.setAttribute("text-anchor","end");
+      badge.setAttribute("fill","#06b6d4"); badge.setAttribute("font-size","11");
+      badge.setAttribute("title","has detailed doc — click to view");
+      badge.textContent="📄";
+      g2.appendChild(badge);
+    }
     g2.addEventListener("click",()=>showFact(f,g));
     g2.addEventListener("mouseenter",()=>highlightFact(id));
     g2.addEventListener("mouseleave",()=>unhighlight());
@@ -335,7 +345,8 @@ function showFact(f,g){
   const inE=(g.intents||[]).filter(i=>i.to===f.id);
   const outE=(g.intents||[]).filter(i=>(i.from||[]).includes(f.id));
   body(`<div class="k">fact</div><div class="v" style="color:var(--cyan);font-weight:700">${esc(f.id)}${f.title?` &nbsp;·&nbsp; <span style="color:var(--amber)">${esc(f.title)}</span>`:""}</div>
-    <div class="k">description</div><pre>${esc(f.description)}</pre>
+    <div class="k">description (gist)</div><pre>${esc(f.description)}</pre>
+    ${f.doc?`<div class="k">doc (detailed) <span style="color:var(--cyan)">📄</span></div><pre>${esc(f.doc)}</pre>`:""}
     <div class="k">created</div><div class="v">${esc(f.created_at||"")} · ${esc(f.creator||"")}</div>
     ${f.source_intent?`<div class="k">produced by</div><div class="v">${esc(f.source_intent)}</div>`:""}
     <div class="k">produced by ${inE.length} intent(s)</div><div class="v">${inE.map(i=>i.id).join(", ")||"—"}</div>
@@ -344,7 +355,8 @@ function showFact(f,g){
 }
 function showIntent(i,g){
   body(`<div class="k">intent</div><div class="v" style="color:var(--amber);font-weight:700">${esc(i.id)}${i.title?` &nbsp;·&nbsp; <span style="color:var(--cyan)">${esc(i.title)}</span>`:""}</div>
-    <div class="k">description</div><pre>${esc(i.description)}</pre>
+    <div class="k">description (gist)</div><pre>${esc(i.description)}</pre>
+    ${i.doc?`<div class="k">doc (detailed) <span style="color:var(--cyan)">📄</span></div><pre>${esc(i.doc)}</pre>`:""}
     <div class="k">from</div><div class="v">${esc((i.from||[]).join(", "))}</div>
     <div class="k">to</div><div class="v">${i.to?esc(i.to):"<span style='color:var(--amber)'>open (no result yet)</span>"}</div>
     <div class="k">status</div><div class="v">${esc(i.status||"")} · worker ${esc(i.worker||"—")}</div>

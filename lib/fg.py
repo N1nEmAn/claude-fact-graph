@@ -134,13 +134,14 @@ class Store:
         return read_json(p)
 
     def add_fact(self, description: str, creator: str, source_intent: str | None,
-                 title: str | None = None) -> dict:
+                 title: str | None = None, doc: str | None = None) -> dict:
         with self.locked():
             fid = self._next_id("fact", "f")
             fact = {
                 "id": fid,
                 "title": (title.strip() if title and title.strip() else None),
                 "description": description.strip(),
+                "doc": (doc.strip() if doc and doc.strip() else None),
                 "created_at": now_iso(),
                 "creator": creator,
                 "source_intent": source_intent,
@@ -175,6 +176,7 @@ class Store:
         creator: str,
         requires_confirmation: bool = False,
         title: str | None = None,
+        doc: str | None = None,
     ) -> dict:
         with self.locked():
             self._validate_from(from_ids)
@@ -185,6 +187,7 @@ class Store:
                 "from": from_ids,
                 "to": None,
                 "description": description.strip(),
+                "doc": (doc.strip() if doc and doc.strip() else None),
                 "creator": creator,
                 "status": "open",
                 "worker": None,
@@ -224,6 +227,7 @@ class Store:
 
     def conclude_with_new_fact(
         self, iid: str, description: str, worker: str, title: str | None = None,
+        doc: str | None = None,
     ) -> tuple[dict, dict]:
         """Atomically: re-check the intent is still open under lock, allocate a new
         fact id, write the fact, and link the intent to it — all in ONE locked
@@ -242,6 +246,7 @@ class Store:
                 "id": fid,
                 "title": (title.strip() if title and title.strip() else None),
                 "description": description.strip(),
+                "doc": (doc.strip() if doc and doc.strip() else None),
                 "created_at": now_iso(),
                 "creator": worker,
                 "source_intent": iid,
@@ -437,7 +442,8 @@ def render_graph_text(store: Store) -> str:
     for f in g["facts"]:
         src = f"  <- {f['source_intent']}" if f.get("source_intent") else ""
         t = f"[{f['title']}]  " if f.get("title") else ""
-        lines.append(f"  {f['id']}: {t}{f['description']}{src}")
+        doc = "  📄" if f.get("doc") else ""
+        lines.append(f"  {f['id']}: {t}{f['description']}{src}{doc}")
     lines.append("")
     lines.append("## intents")
     for i in g["intents"]:
@@ -448,7 +454,8 @@ def render_graph_text(store: Store) -> str:
         elif i["status"] == "claimed":
             flag = f"  ~{i['worker']}"
         t = f"[{i['title']}]  " if i.get("title") else ""
-        lines.append(f"  {i['id']}: {i['from']} -> {to}  {t}{i['description'][:70]}{flag}")
+        doc = "  📄" if i.get("doc") else ""
+        lines.append(f"  {i['id']}: {i['from']} -> {to}  {t}{i['description'][:70]}{flag}{doc}")
     if g["hints"]:
         lines.append("")
         lines.append("## hints")
@@ -509,25 +516,35 @@ def _hint_brief(h: dict) -> dict:
 
 
 def _to_yaml_like(g: dict) -> str:
-    """Compact human-readable dump of the graph for prompts."""
+    """Compact human-readable dump of the graph for prompts.
+    Shows title + description (the two summary layers) but NOT `doc` — the
+    detailed layer is opt-in, read via `fgc doc <id>`, so prompts stay small."""
     lines = []
     lines.append(f"project: status={g['project']['status']}")
     lines.append(f"goal: {g['project']['goal']}")
     lines.append("facts:")
     for f in g["facts"]:
         src = f" (from {f['source_intent']})" if f.get("source_intent") else ""
-        lines.append(f"  - {f['id']}: {f['description']}{src}")
+        title = f"[{f['title']}] " if f.get("title") else ""
+        has_doc = " (has doc)" if f.get("doc") else ""
+        lines.append(f"  - {f['id']}: {title}{f['description']}{src}{has_doc}")
     lines.append("intents:")
     for i in g["intents"]:
         to = i["to"] or "open"
         flag = ""
         if i["requires_confirmation"] and not i["confirmed_at"]:
             flag = " [needs_confirmation]"
-        lines.append(f"  - {i['id']}: {i['from']} -> {to}{flag} | {i['description']}")
+        title = f"[{i['title']}] " if i.get("title") else ""
+        has_doc = " (has doc)" if i.get("doc") else ""
+        lines.append(f"  - {i['id']}: {i['from']} -> {to}{flag} | {title}{i['description']}{has_doc}")
     if g["hints"]:
         lines.append("hints:")
         for h in g["hints"]:
             lines.append(f"  - {h['id']} ({h['creator']}): {h['content']}")
+    lines.append(
+        "note: nodes marked (has doc) carry a detailed layer — read it with "
+        "`fgc doc <id>` when you need the full context."
+    )
     return "\n".join(lines)
 
 
@@ -654,6 +671,19 @@ def parse_from(raw: str) -> list[str]:
     return out
 
 
+def _read_doc_arg(args) -> str | None:
+    """Resolve the `doc` body from CLI flags: --doc '<text>' inline, or
+    --doc-file <path> read from disk. --doc-file wins if both given."""
+    doc_file = getattr(args, "doc_file", None)
+    if doc_file:
+        p = Path(doc_file)
+        if not p.exists():
+            raise FGError(f"doc file not found: {p}")
+        text = p.read_text(encoding="utf-8")
+        return text or None
+    return getattr(args, "doc", None)
+
+
 def _assert_safe_store_root(root: Path, action: str) -> None:
     """Refuse to delete a path that doesn't look like a fact-graph store
     (review H4): must contain project.json, and must not be a filesystem
@@ -758,6 +788,7 @@ def cmd_fact(args) -> int:
         creator=args.creator,
         source_intent=args.from_intent,
         title=args.title,
+        doc=_read_doc_arg(args),
     )
     print(fact["id"])
     if args.json:
@@ -775,6 +806,7 @@ def cmd_intent(args) -> int:
         creator=args.creator,
         requires_confirmation=args.confirm,
         title=args.title,
+        doc=_read_doc_arg(args),
     )
     print(intent["id"])
     if args.json:
@@ -811,6 +843,61 @@ def cmd_show(args) -> int:
     return 0
 
 
+def cmd_doc(args) -> int:
+    """Read or write a node's detailed document (the third doc layer).
+    `fgc doc f001` prints the doc; `fgc doc f001 --set '<text>'` /
+    `--set-file <path>` writes it. Pass --edit to open $EDITOR."""
+    store = Store(Path(args.store))
+    store.require()
+    # resolve the node (fact or intent) into a dir+path
+    if (store.facts_dir / f"{args.id}.json").exists():
+        node = store.get_fact(args.id)
+        target_dir = store.facts_dir
+    elif (store.intents_dir / f"{args.id}.json").exists():
+        node = store.get_intent(args.id)
+        target_dir = store.intents_dir
+    else:
+        raise FGError(f"no fact or intent named {args.id}")
+
+    # WRITE paths
+    if args.set is not None or args.set_file or args.edit:
+        if args.edit:
+            new_doc = _edit_via_editor(node.get("doc") or "", title=f"{args.id} doc")
+        elif args.set_file:
+            new_doc = Path(args.set_file).read_text(encoding="utf-8")
+        else:
+            new_doc = args.set
+        new_doc = new_doc.strip() if isinstance(new_doc, str) else None
+        node["doc"] = (new_doc or None)
+        atomic_write_json(target_dir / f"{args.id}.json", node)
+        print(f"updated doc for {args.id} ({len(node['doc'] or '')} chars)" if node["doc"]
+              else f"cleared doc for {args.id}")
+        return 0
+
+    # READ path: print the doc (or note its absence)
+    doc = node.get("doc")
+    if doc:
+        print(doc)
+    else:
+        sys.stderr.write(f"{args.id} has no doc. add one: fgc doc {args.id} --set '...' or --edit\n")
+        return 1
+    return 0
+
+
+def _edit_via_editor(initial: str, title: str) -> str:
+    import subprocess
+    import tempfile
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
+    with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False, encoding="utf-8") as fh:
+        fh.write(initial)
+        tmp = fh.name
+    try:
+        subprocess.run([editor, tmp], check=True)
+        return Path(tmp).read_text(encoding="utf-8")
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
 def cmd_claim(args) -> int:
     store = Store(Path(args.store))
     store.require()
@@ -833,7 +920,7 @@ def cmd_done(args) -> int:
     store.require()
     # atomic fact-create + conclude (no orphan if intent already done — review H1)
     fact, intent = store.conclude_with_new_fact(
-        args.id, args.fact, args.worker, title=args.title,
+        args.id, args.fact, args.worker, title=args.title, doc=_read_doc_arg(args),
     )
     print(f"{args.id} -> {fact['id']}  ({intent['status']})")
     return 0
@@ -967,11 +1054,11 @@ def _dispatch_explore(store, templates_dir, intent, model, timeout, skip, cwd, a
     )
     text = envelope.get("result", "")
     payload = extract_json_object(text)
-    title, desc = _parse_explore_payload(payload)
+    title, desc, doc = _parse_explore_payload(payload)
     # record the produced fact AND link the intent atomically — no orphan fact
     # if a concurrent executor already concluded this intent (review C1/H1).
     fact, intent = store.conclude_with_new_fact(
-        intent["id"], desc, worker, title=title,
+        intent["id"], desc, worker, title=title, doc=doc,
     )
     print(f"[explore] {intent['id']} -> {fact['id']}: {desc}")
     return 0
@@ -1071,17 +1158,19 @@ def _apply_reason(store: Store, kind: str, data) -> str:
             req = bool(it.get("requires_confirmation", False))
             t = it.get("title")
             t = t.strip() if isinstance(t, str) and t.strip() else None
+            d = it.get("doc")
+            d = d.strip() if isinstance(d, str) and d.strip() else None
             intent = store.add_intent(
                 from_ids=from_ids, description=desc, creator="reason",
-                requires_confirmation=req, title=t,
+                requires_confirmation=req, title=t, doc=d,
             )
             made.append(intent["id"])
         return f"proposed intents: {', '.join(made) if made else '(none valid)'}"
     return "unknown"
 
 
-def _parse_explore_payload(payload: dict) -> tuple[str | None, str]:
-    """Return (title, description). title may be None."""
+def _parse_explore_payload(payload: dict) -> tuple[str | None, str, str | None]:
+    """Return (title, description, doc). title and doc may be None."""
     if payload.get("accepted") is False:
         raise FGError(f"executor rejected: {payload.get('reason','')}")
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
@@ -1092,7 +1181,9 @@ def _parse_explore_payload(payload: dict) -> tuple[str | None, str]:
         raise FGError("explore payload missing 'description'")
     title = data.get("title")
     title = title.strip() if isinstance(title, str) and title.strip() else None
-    return title, desc.strip()
+    doc = data.get("doc")
+    doc = doc.strip() if isinstance(doc, str) and doc.strip() else None
+    return title, desc.strip(), doc
 
 
 def _parse_verify_payload(payload: dict) -> tuple[bool, str]:
@@ -1530,9 +1621,9 @@ def _run_explore_raw(store, templates_dir, intent, model, timeout, skip, cwd, cl
         append_system=_agents_system_prompt(store), cwd=cwd,
     )
     payload = extract_json_object(envelope.get("result", ""))
-    title, desc = _parse_explore_payload(payload)
+    title, desc, doc = _parse_explore_payload(payload)
     # atomic fact-create + conclude: no orphan if a concurrent executor won (C1/H1)
-    fact, _ = store.conclude_with_new_fact(intent["id"], desc, worker, title=title)
+    fact, _ = store.conclude_with_new_fact(intent["id"], desc, worker, title=title, doc=doc)
     return fact
 
 
@@ -1577,13 +1668,21 @@ This project uses a fact-graph as shared working memory. The graph lives at
 ## commands you will use
 ```
 fgc status                     # project state + what's ready to work
-fgc graph                      # full graph as text
+fgc graph                      # full graph as text (title + one-line summary + 📄 markers)
 fgc frontier                   # only the ready open intents
-fgc show intent <id>           # detail
-fgc fact "<observation>"       # record something you confirmed
-fgc done <intent-id> --fact "<result>"   # finish an intent, produce a fact
+fgc show intent <id>           # full node detail
+fgc doc <id>                   # read the DETAILED document of a fact/intent (when you need depth)
+fgc fact "<gist>" -t "<title>" [--doc "<detail>"]   # record a confirmed result
+fgc done <intent-id> --fact "<gist>" -t "<title>"   # finish an intent, produce a fact
 fgc hint "<message>"           # leave a note for the commander / human
 ```
+
+## three documentation layers (every node)
+1. **title** — short (2-10 字) human label, shown in the graph view.
+2. **description** — one-sentence gist. Injected into prompts by default.
+3. **doc** — detailed markdown (commands, paths, evidence). NOT in prompts by
+   default; READ it with `fgc doc <id>` when you need the full context.
+   WRITE it with `--doc "..."` or `--doc-file <path>`.
 
 ## rules
 1. Record only what you actually confirmed with a command, file, or log.
@@ -1630,9 +1729,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_pick)
 
     sp = sub.add_parser("fact", help="add a confirmed fact")
-    sp.add_argument("description")
+    sp.add_argument("description", help="summary (one sentence) — the gist of this node")
     sp.add_argument("--title", "-t", default=None,
                     help="short human title shown in the graph view (中文标题)")
+    sp.add_argument("--doc", default=None,
+                    help="detailed document body (markdown). For long text use --doc-file")
+    sp.add_argument("--doc-file", default=None,
+                    help="read the detailed document from this file path")
     sp.add_argument("--creator", default="user")
     sp.add_argument("--from-intent", default=None, help="intent that produced this fact")
     sp.add_argument("--json", action="store_true")
@@ -1640,9 +1743,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("intent", help="add an intent (a unit of work)")
     sp.add_argument("--from", dest="from_", required=True, help="comma/space separated fact ids")
-    sp.add_argument("description")
+    sp.add_argument("description", help="summary (one sentence) — what this intent will do")
     sp.add_argument("--title", "-t", default=None,
                     help="short human title shown in the graph view (中文标题)")
+    sp.add_argument("--doc", default=None,
+                    help="detailed document body (markdown). For long text use --doc-file")
+    sp.add_argument("--doc-file", default=None,
+                    help="read the detailed document from this file path")
     sp.add_argument("--creator", default="user")
     sp.add_argument("--confirm", action="store_true", help="requires human confirmation")
     sp.add_argument("--json", action="store_true")
@@ -1659,6 +1766,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("id", nargs="?", default=None)
     sp.set_defaults(func=cmd_show)
 
+    sp = sub.add_parser(
+        "doc",
+        help="read or write a node's detailed document (the third layer)",
+        description=(
+            "Manage the detailed 'doc' field of a fact or intent. "
+            "`fgc doc f001` prints it; `fgc doc f001 --set '<text>'` or "
+            "`--set-file <path>` writes it; `--edit` opens $EDITOR. "
+            "title = human glance, description = one-line gist, doc = full detail."
+        ),
+    )
+    sp.add_argument("id", help="fact or intent id (e.g. f001, i003)")
+    sp.add_argument("--set", default=None, help="set the doc body to this text")
+    sp.add_argument("--set-file", default=None, help="read the doc body from this file")
+    sp.add_argument("--edit", action="store_true", help="open the doc in $EDITOR")
+    sp.set_defaults(func=cmd_doc)
+
     sp = sub.add_parser("claim", help="claim an open intent")
     sp.add_argument("id")
     sp.add_argument("--worker", required=True)
@@ -1671,9 +1794,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("done", help="conclude an intent with a produced fact")
     sp.add_argument("id")
-    sp.add_argument("--fact", required=True, help="the confirmed result text")
+    sp.add_argument("--fact", required=True, help="the confirmed result text (summary)")
     sp.add_argument("--title", "-t", default=None,
                     help="short human title shown in the graph view (中文标题)")
+    sp.add_argument("--doc", default=None,
+                    help="detailed document body (markdown). For long text use --doc-file")
+    sp.add_argument("--doc-file", default=None,
+                    help="read the detailed document from this file path")
     sp.add_argument("--worker", default="agent")
     sp.set_defaults(func=cmd_done)
 
