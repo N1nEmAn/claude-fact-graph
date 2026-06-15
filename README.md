@@ -1,5 +1,7 @@
 # fact-graph (`fgc`)
 
+**English** | [中文](README.zh-CN.md)
+
 A **fact-graph working memory for agentic work**, built to run *inside* Claude Code — no database, no server, no web UI, no dependencies beyond the Python 3 standard library.
 
 Facts are nodes. Intents are edges. The graph is one JSON file per node under a project-local `.fg/`, queryable and writable via the `fgc` CLI. A `dispatch` command spawns a Sonnet sub-agent to reason / explore against the graph and write results straight back. An interactive HTML DAG view renders the whole thing and auto-refreshes.
