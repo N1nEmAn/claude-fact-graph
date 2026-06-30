@@ -16,6 +16,7 @@ Pure stdlib. See `fgc --help` and SKILL.md.
 from __future__ import annotations
 
 import argparse
+import difflib
 import fcntl
 import json
 import os
@@ -320,6 +321,9 @@ def read_json(path: Path) -> dict:
         return json.load(fh)
 
 
+_VALID_NODE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,16}$")
+
+
 def _read_node_files(directory: Path, kind: str) -> list[dict]:
     """List all node JSON files in `directory`, skipping any that are malformed
     or schema-broken with a stderr warning (review codex#8: a corrupt .fg/*.json
@@ -339,6 +343,13 @@ def _read_node_files(directory: Path, kind: str) -> list[dict]:
                 f"(missing 'id')\n"
             )
             continue
+        nid = data["id"]
+        if nid != GOAL_ID and not _VALID_NODE_ID_RE.match(nid):
+            sys.stderr.write(
+                f"fgc: warning: skipping {kind} file {p.name}: "
+                f"invalid id {nid!r} (must match [a-z][a-z0-9_-]{{0,16}})\n"
+            )
+            continue
         out.append(data)
     return out
 
@@ -350,6 +361,16 @@ def atomic_write_json(path: Path, data: dict) -> None:
         json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=False)
         fh.write("\n")
     os.replace(tmp, path)
+
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _scrub_inline(text: str) -> str:
+    """Strip control characters (newlines, tabs, etc.) so a single node's
+    title/description always occupies one line in rendered output. This prevents
+    a hostile node from spoofing extra rows in the history/recall/graph view."""
+    return _CONTROL_CHAR_RE.sub(" ", text) if text else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -421,7 +442,7 @@ def render_status(store: Store) -> str:
                 flag = "  [needs confirmation]"
             elif i["status"] == "claimed":
                 flag = f"  [claimed by {i['worker']}]"
-            lines.append(f"  {i['id']}  from {i['from']}  {i['description'][:80]}{flag}")
+            lines.append(f"  {i['id']}  from {i['from']}  {_scrub_inline(i['description'])[:80]}{flag}")
     elif g["open_intents"]:
         lines.append("")
         lines.append("(open intents exist but none ready — check confirmations)")
@@ -434,6 +455,153 @@ def render_status(store: Store) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- #
+# recall — "have we done something like this before?"
+#
+# The model receives a task; before acting, it should consult the graph for
+# prior facts/intents whose title or description overlaps. This is the
+# "experience reuse" entry point: cheap substring + difflib similarity, no
+# embedding, no deps. Recall is by design TITLE+DESCRIPTION only — the heavy
+# `doc` field is opt-in via `fgc doc <id>` once a candidate looks promising.
+# --------------------------------------------------------------------------- #
+_RECALL_TOKEN_RE = re.compile(r"[\w一-鿿]+", re.UNICODE)
+
+
+def _recall_tokenize(text: str) -> list[str]:
+    """Lowercase + Unicode-word/CJK tokenization. CJK each char is a token so
+    '空指针定位' splits into 4 tokens that match individually."""
+    if not text:
+        return []
+    out: list[str] = []
+    for tok in _RECALL_TOKEN_RE.findall(text.lower()):
+        # CJK runs: split into individual chars (each is content-bearing)
+        if any("一" <= ch <= "鿿" for ch in tok):
+            out.extend(list(tok))
+        else:
+            out.append(tok)
+    return [t for t in out if t]
+
+
+def _recall_score(query: str, node: dict) -> float:
+    """Score a node against a free-text query. Combines:
+      - token overlap on title (weighted x2) and description
+      - difflib ratio against the joined haystack
+    Returns 0.0 if nothing useful matches."""
+    title = (node.get("title") or "").lower()
+    desc = (node.get("description") or "").lower()
+    haystack = f"{title} {title} {desc}".strip()  # title weighted x2
+    if not haystack:
+        return 0.0
+    q_tokens = set(_recall_tokenize(query))
+    if not q_tokens:
+        return 0.0
+    h_tokens = set(_recall_tokenize(haystack))
+    if not h_tokens:
+        return 0.0
+    overlap = len(q_tokens & h_tokens)
+    if overlap == 0:
+        # cheap difflib fallback for fuzzy matches (typo, partial English word)
+        ratio = difflib.SequenceMatcher(None, query.lower(), haystack).ratio()
+        return ratio if ratio >= 0.45 else 0.0
+    overlap_score = overlap / max(1, len(q_tokens))
+    # add a small ratio bonus so longer aligned chunks edge out shorter ones
+    ratio_bonus = 0.2 * difflib.SequenceMatcher(None, query.lower(), haystack).ratio()
+    return overlap_score + ratio_bonus
+
+
+def recall(store: Store, query: str, limit: int = 5,
+           kinds: tuple[str, ...] = ("fact", "intent")) -> list[dict]:
+    """Return top-N nodes by similarity to `query`. Each returned dict has:
+        id, kind, title, description, has_doc, score
+    Ordered by score desc, then by id (stable).
+    """
+    if not query or not query.strip():
+        return []
+    candidates: list[dict] = []
+    if "fact" in kinds:
+        for f in store.list_facts():
+            if f.get("id") == GOAL_ID:
+                continue  # skip the terminal goal node
+            s = _recall_score(query, f)
+            if s > 0:
+                candidates.append({
+                    "id": f["id"],
+                    "kind": "fact",
+                    "title": f.get("title"),
+                    "description": f.get("description", ""),
+                    "has_doc": bool(f.get("doc")),
+                    "score": s,
+                })
+    if "intent" in kinds:
+        for i in store.list_intents():
+            s = _recall_score(query, i)
+            if s > 0:
+                candidates.append({
+                    "id": i["id"],
+                    "kind": "intent",
+                    "title": i.get("title"),
+                    "description": i.get("description", ""),
+                    "has_doc": bool(i.get("doc")),
+                    "score": s,
+                })
+    candidates.sort(key=lambda c: (-c["score"], c["id"]))
+    return candidates[:limit]
+
+
+def render_recall(matches: list[dict], query: str) -> str:
+    """Human-readable recall output. First line is a usage hint so the
+    caller (model or human) knows the next step is `fgc doc <id>`."""
+    if not matches:
+        return f"(no similar prior work for {query!r})"
+    lines = [
+        f"# recall for: {query}",
+        "# use `fgc doc <id>` to read the detailed document",
+        "",
+    ]
+    for m in matches:
+        title = f"[{_scrub_inline(m['title'])}]  " if m["title"] else ""
+        doc = "  📄" if m["has_doc"] else ""
+        desc = _scrub_inline(m["description"])[:90]
+        lines.append(
+            f"  {m['id']} ({m['kind']}, score={m['score']:.2f})  "
+            f"{title}{desc}{doc}"
+        )
+    return "\n".join(lines)
+
+
+def render_history_block(store: Store, *, max_facts: int = 8,
+                         max_intents: int = 4) -> str:
+    """Compact history snapshot for hook injection: recent confirmed facts
+    + recently-done intents, title + one-line description only. The model
+    eyeballs this to decide whether it has seen the current request before."""
+    facts = [f for f in store.list_facts() if f.get("id") != GOAL_ID]
+    # facts are immutable; show most recent first
+    facts.sort(key=lambda f: f.get("created_at", ""), reverse=True)
+    done = [i for i in store.list_intents() if not is_open(i)]
+    done.sort(key=lambda i: i.get("concluded_at") or "", reverse=True)
+
+    lines: list[str] = []
+    if facts:
+        lines.append("history facts (most recent first):")
+        for f in facts[:max_facts]:
+            title = f"[{_scrub_inline(f['title'])}] " if f.get("title") else ""
+            doc = " 📄" if f.get("doc") else ""
+            desc = _scrub_inline(f.get("description") or "")[:90]
+            lines.append(f"  {f['id']}: {title}{desc}{doc}")
+    if done:
+        if lines:
+            lines.append("")
+        lines.append("recently-done intents:")
+        for i in done[:max_intents]:
+            title = f"[{_scrub_inline(i['title'])}] " if i.get("title") else ""
+            doc = " 📄" if i.get("doc") else ""
+            desc = _scrub_inline(i.get("description") or "")[:90]
+            lines.append(f"  {i['id']}: {title}{desc}{doc}")
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
 def render_graph_text(store: Store) -> str:
     g = build_graph_view(store)
     lines = [f"# graph  ({g['project']['status']})"]
@@ -441,9 +609,9 @@ def render_graph_text(store: Store) -> str:
     lines.append("## facts")
     for f in g["facts"]:
         src = f"  <- {f['source_intent']}" if f.get("source_intent") else ""
-        t = f"[{f['title']}]  " if f.get("title") else ""
+        t = f"[{_scrub_inline(f['title'])}]  " if f.get("title") else ""
         doc = "  📄" if f.get("doc") else ""
-        lines.append(f"  {f['id']}: {t}{f['description']}{src}{doc}")
+        lines.append(f"  {f['id']}: {t}{_scrub_inline(f['description'])}{src}{doc}")
     lines.append("")
     lines.append("## intents")
     for i in g["intents"]:
@@ -453,9 +621,9 @@ def render_graph_text(store: Store) -> str:
             flag = "  !confirm"
         elif i["status"] == "claimed":
             flag = f"  ~{i['worker']}"
-        t = f"[{i['title']}]  " if i.get("title") else ""
+        t = f"[{_scrub_inline(i['title'])}]  " if i.get("title") else ""
         doc = "  📄" if i.get("doc") else ""
-        lines.append(f"  {i['id']}: {i['from']} -> {to}  {t}{i['description'][:70]}{flag}{doc}")
+        lines.append(f"  {i['id']}: {i['from']} -> {to}  {t}{_scrub_inline(i['description'])[:70]}{flag}{doc}")
     if g["hints"]:
         lines.append("")
         lines.append("## hints")
@@ -490,10 +658,19 @@ def render_prompt(store: Store, template_text: str) -> str:
 
 def render_intent_prompt(store: Store, template_text: str, intent: dict) -> str:
     g = build_graph_view(store)
+    # Recall: surface prior facts/intents whose title/description look similar
+    # to THIS intent. Excludes the intent itself (it would otherwise score 1.0
+    # against its own description). Keep small (5) — the model just needs a
+    # short list of ids it can `fgc doc` into.
+    matches = [m for m in recall(store, intent.get("description", ""), limit=6)
+               if m["id"] != intent["id"]][:5]
+    recall_block = render_recall(matches, intent.get("description", "")) \
+        if matches else "(no prior nodes look similar to this intent)"
     replacements = {
         "graph_yaml": _to_yaml_like(g),
         "intent_id": intent["id"],
         "intent_description": intent["description"],
+        "recall_block": recall_block,
     }
     out = template_text
     for key, val in replacements.items():
@@ -882,6 +1059,32 @@ def cmd_doc(args) -> int:
         sys.stderr.write(f"{args.id} has no doc. add one: fgc doc {args.id} --set '...' or --edit\n")
         return 1
     return 0
+
+
+def cmd_recall(args) -> int:
+    """Find prior facts/intents whose title+description look similar to the
+    given query. Use this BEFORE starting a new task: if a strong match
+    exists, read its doc with `fgc doc <id>` and reuse what was learned."""
+    store = Store(Path(args.store))
+    store.require()
+    query = (args.query or "").strip()
+    if not query:
+        raise FGError("recall: query is required")
+    if args.limit < 1:
+        raise FGError("recall: --limit must be >= 1")
+    kinds: tuple[str, ...]
+    if args.kind == "fact":
+        kinds = ("fact",)
+    elif args.kind == "intent":
+        kinds = ("intent",)
+    else:
+        kinds = ("fact", "intent")
+    matches = recall(store, query, limit=args.limit, kinds=kinds)
+    if args.json:
+        print(json.dumps(matches, ensure_ascii=False, indent=2))
+    else:
+        print(render_recall(matches, query))
+    return 0 if matches else 1
 
 
 def _edit_via_editor(initial: str, title: str) -> str:
@@ -1781,6 +1984,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--set-file", default=None, help="read the doc body from this file")
     sp.add_argument("--edit", action="store_true", help="open the doc in $EDITOR")
     sp.set_defaults(func=cmd_doc)
+
+    sp = sub.add_parser(
+        "recall",
+        help="find prior facts/intents similar to <query> (read their doc to reuse)",
+        description=(
+            "Search title+description of every fact and intent for nodes "
+            "similar to the query. The intended flow before starting any new "
+            "task: `fgc recall '<task gist>'` → scan top hits → "
+            "`fgc doc <id>` on the most relevant one to read the detailed "
+            "context and reuse what was learned. Cheap Unicode/CJK-aware "
+            "token overlap + difflib fuzzy fallback; no embeddings."
+        ),
+    )
+    sp.add_argument("query", help="free-text task gist (中文 ok)")
+    sp.add_argument("--limit", "-n", type=int, default=5,
+                    help="max results (default: 5); must be >= 1")
+    sp.add_argument("--kind", choices=["fact", "intent", "any"], default="any",
+                    help="restrict to one kind (default: any)")
+    sp.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    sp.set_defaults(func=cmd_recall)
 
     sp = sub.add_parser("claim", help="claim an open intent")
     sp.add_argument("id")

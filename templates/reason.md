@@ -59,6 +59,13 @@ Reject only when execution would be clearly inappropriate:
 - Prefer debugging loops that isolate the cause: reproduce, inspect logs,
   reduce the failing case, patch, rerun, record.
 - Do not invent results. If evidence is missing, propose an intent to get it.
+- **Reuse prior work.** Before proposing a NEW intent, check whether the
+  Graph already contains a similar prior fact/intent (look at titles +
+  descriptions in the Graph block; if you have shell access, `fgc recall
+  "<gist>"` plus `fgc doc <id>` are the canonical recall path). If a prior
+  node already covers the same step, do NOT propose a duplicate — either
+  build on its produced fact, or propose an intent that explicitly extends
+  it (and cite the prior id in your description).
 
 # Context
 ## Graph

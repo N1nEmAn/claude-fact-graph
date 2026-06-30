@@ -89,6 +89,7 @@ fgc fact "<observation>" -t "<中文标题>"        # add a fact
 fgc intent --from f001 "do X" -t "<标题>"      # add work
 fgc intent --from f001 "rm prod" --confirm     # needs approval
 fgc done i003 --fact "<result>" -t "<标题>"    # conclude + record
+fgc recall "<task gist>"                       # prior similar facts/intents (read with `fgc doc <id>`)
 fgc complete --from f005 --note "..."          # finish project
 fgc confirm i007                               # approve gated work
 fgc hint "<message>"                           # message the commander

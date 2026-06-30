@@ -88,6 +88,7 @@ fgc fact "<观察>" -t "<中文标题>"               # 加一个事实
 fgc intent --from f001 "做某事" -t "<标题>"     # 加一个工作
 fgc intent --from f001 "删生产数据" --confirm   # 需要人工确认
 fgc done i003 --fact "<结果>" -t "<标题>"       # 结束 intent 并记录结果
+fgc recall "<任务一句话>"                       # 检索相似的历史 fact/intent（用 fgc doc <id> 读详情复用）
 fgc complete --from f005 --note "..."          # 标记项目完成
 fgc confirm i007                               # 批准需要确认的 intent
 fgc claim i001 --worker alice                  # 占用边（多智能体时）
