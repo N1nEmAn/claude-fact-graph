@@ -1,10 +1,10 @@
 ---
 name: fact-graph
-description: A fact-graph working memory for agentic work — replaces heavy agent front/backends with JSON files + shell. Maintains a DAG of facts (confirmed observations) and intents (units of work), queryable and writable via the `fgc` CLI, with a `dispatch` command that spawns a Sonnet agent to reason/explore against the graph. Use when the user wants to track multi-step agent work as a shared, observable graph — debugging campaigns, research reproduction, security audits — without a database or web UI. Triggers include "fact graph", "事实图", "track agent progress", "working memory for agents", "StarVoya-style graph", "commander executor without backend".
+description: A fact-graph working memory for AI agent work — replaces heavy agent front/backends with JSON files + shell. Maintains a DAG of facts (confirmed observations) and intents (units of work), queryable and writable via the `fgc` CLI, with dispatch for Sonnet executor steps, project hooks that inject graph state and current date output, and optional user-authorized tmux peer messaging via fgc peers/send. Use when the user wants to track multi-step agent work as a shared, observable graph — debugging campaigns, research reproduction, security audits, multi-agent tmux ops — without a database or web UI.
 license: MIT
 ---
 
-# fact-graph
+# AI fact graph
 
 A **fact graph** is shared working memory for agentic work: a DAG where
 **facts** (confirmed observations) are nodes and **intents** (units of work)
@@ -26,12 +26,10 @@ no global store, no `~/.fg`, no database, no central registry:
 - **Data**: `./.fg/` in whatever project you're in. `rm -rf .fg` wipes it. Move
   or delete the project directory and the graph goes with it. Nothing is ever
   written under `~` for graph data.
-- **Hooks** (the always-on trigger): registered once in `~/.claude/settings.json`
-  by `install.sh`. They are **dormant by design** — each turn they walk up from
-  the cwd looking for a `.fg/`; if none exists they emit nothing and cost
-  nothing. So a global registration activates the behavior only in projects that
-  have opted in by running `fgc init`. The registration is idempotent and
-  reversible (`install.sh --uninstall`).
+- **Hooks**: registered by `fgc setup` in this project's
+  `./.claude/settings.json`, not globally. If a project has no local `.fg/`, the
+  hook bridge is silent. Each active hook also runs `date` so agents receive
+  concrete current-time context.
 
 A project that uses the graph:
 
@@ -42,6 +40,8 @@ your-project/
 │   ├── facts/{goal,f001,…}.json
 │   ├── intents/i001.json …
 │   ├── hints/
+│   ├── ai-peers.json        # optional user-authorized tmux peer targets
+│   └── ai-channel.txt       # optional append-only peer message log
 └── AGENTS.md                 # (optional) protocol for dispatched agents
 ```
 
@@ -70,13 +70,13 @@ fact-graph/
 ├── SKILL.md                      # you are here
 ├── lib/
 │   ├── fg.py                     # the CLI (zero deps)
-│   ├── fg-hook.py                # Claude Code hook bridge (always-on)
-│   └── _settings_patch.py        # idempotent hooks installer
+│   ├── fg-hook.py                # Claude Code project hook bridge
+│   └── _settings_patch.py        # idempotent project hook patcher
 ├── templates/
 │   ├── reason.md                 # commander prompt: "what's next?"
 │   ├── explore.md                # executor prompt: "do this intent"
 │   └── verify.md                 # verify an executor's claimed result
-├── install.sh                    # symlinks `fgc` + wires hooks
+├── install.sh                    # symlinks `fgc` + installs /fgc-setup skill
 └── examples/
     └── README.md                 # a worked example
 ```
@@ -84,26 +84,21 @@ fact-graph/
 ## Install
 
 ```bash
-bash /home/S3vn/Progress/202606/newharness/factgraph/install.sh
-# --cli-only    just symlink fgc, do NOT touch settings.json
-# --uninstall   remove the symlink + the two hook entries
+bash install.sh
+# --cli-only    just symlink fgc, do NOT install the skill
+# --uninstall   remove the symlink + skill
 ```
 
 `fgc` uses only Python 3 stdlib — no `pip install`.
 
-The full install also registers two **hooks** in `~/.claude/settings.json`. The
-installer backs up the file first (`.json.bak`), is idempotent, and **never
-removes or alters hooks you already have**:
+`install.sh` does not register global hooks. To opt in a project, run:
 
-- **SessionStart** — walks up from cwd; if a `.fg/` exists, tells the model to
-  read it before working.
-- **UserPromptSubmit** — walks up from cwd; if a `.fg/` exists, injects the
-  current status + frontier as context before *every* turn. If no graph exists
-  and the prompt looks multi-step, it suggests `fgc init`. Trivial prompts stay
-  completely silent.
+```bash
+fgc setup --goal "reproduce the empty-token crash" --agents
+```
 
-That registration is global, but **behavior is per-project**: no `.fg/` means
-no injection, no cost, no noise. The graph itself is never stored globally.
+That writes the graph, project-scoped hooks, and optional `AGENTS.md` in the
+current project only.
 
 ## Core model
 
@@ -138,8 +133,20 @@ fgc done i003 --fact "crash reproduced: see out.log"        # conclude + record
 fgc complete --from f005 --note "root cause patched"        # finish project
 fgc confirm i007                                            # approve gated work
 fgc hint "check the middleware order"                       # message commander
+fgc peers --discover                                        # list tmux panes
+fgc peers --add harley --target api-6:0.0                   # authorize a peer
+fgc send harley "status?"                                   # send + log message
 fgc teardown [--purge]                                      # opt-out THIS project
 ```
+
+### peers / send — authorized tmux peer messaging
+
+Use `fgc peers --discover` to list tmux panes, then ask the user which panes or
+AI agents may communicate. Only after explicit approval, store the target with
+`fgc peers --add NAME --target SESSION:WINDOW.PANE`. `fgc send NAME ...` refuses
+unknown peers, appends to `.fg/ai-channel.txt`, and uses tmux paste-buffer with
+extra newlines so Claude Code-style TUIs submit reliably. Never infer peer
+authorization from discovery output alone.
 
 ### view — the HTML visualization
 
@@ -256,5 +263,5 @@ placeholders: `{origin}`, `{goal}`, `{graph_yaml}`, `{fact_ids}`,
 - Dispatch: `cmd_dispatch`, `run_claude`, `_apply_reason`, `_parse_explore_payload`
 - Auto-loop driver: `cmd_auto`, `_run_reason_raw`, `_run_explore_raw`, `_run_verify_raw`
 - LLM-output parsing (tolerant of surrounding prose): `extract_json_object`
-- Always-on hooks: `lib/fg-hook.py` (SessionStart / UserPromptSubmit),
-  `lib/_settings_patch.py` (idempotent installer)
+- Project hooks: `lib/fg-hook.py` (SessionStart / UserPromptSubmit),
+  `lib/_settings_patch.py` (idempotent project settings patcher)

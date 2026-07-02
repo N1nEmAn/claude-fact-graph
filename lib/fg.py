@@ -31,6 +31,9 @@ __version__ = "0.1.0"
 GOAL_ID = "goal"
 DEFAULT_STORE = ".fg"
 LOCK_NAME = ".lock"
+PEERS_FILE = "ai-peers.json"
+AI_CHANNEL_NAME = "ai-channel.txt"
+PEER_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 # --------------------------------------------------------------------------- #
 # time
@@ -1266,6 +1269,7 @@ def cmd_setup(args) -> int:
         "\nsetup done. This project now auto-reads/maintains its fact graph.\n"
         "  fgc status          # see current state\n"
         "  fgc dispatch reason # propose next work\n"
+        "  fgc peers --discover # optional: list tmux panes, then ask user who to authorize\n"
         "  fgc auto --skip-permissions  # drive to completion\n"
         "To undo:  fgc teardown   (removes .claude/hooks + AGENTS.md; keeps .fg/)"
     )
@@ -1653,6 +1657,223 @@ def _graph_signature(store: Store) -> tuple:
     return (g["project"]["status"], facts, intents)
 
 
+# --------------------------------------------------------------------------- #
+# tmux peer communication
+# --------------------------------------------------------------------------- #
+def _peers_path(store: Store) -> Path:
+    return store.root / PEERS_FILE
+
+
+def _default_peers(store: Store) -> dict:
+    return {
+        "version": 1,
+        "channel": str((store.root / AI_CHANNEL_NAME).resolve()),
+        "peers": {},
+    }
+
+
+def _load_peers(store: Store) -> dict:
+    path = _peers_path(store)
+    if not path.exists():
+        return _default_peers(store)
+    data = read_json(path)
+    if not isinstance(data, dict):
+        raise FGError(f"invalid peers config at {path}")
+    data.setdefault("version", 1)
+    data.setdefault("channel", str((store.root / AI_CHANNEL_NAME).resolve()))
+    data.setdefault("peers", {})
+    if not isinstance(data["peers"], dict):
+        raise FGError(f"invalid peers config at {path}: peers must be an object")
+    return data
+
+
+def _save_peers(store: Store, data: dict) -> None:
+    with store.locked():
+        atomic_write_json(_peers_path(store), data)
+
+
+def _tmux_target_exists(target: str) -> bool:
+    try:
+        proc = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target, "#{pane_id}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+        )
+        return proc.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _tmux_discover() -> list[dict]:
+    fmt = (
+        "#{session_name}:#{window_index}.#{pane_index}\t"
+        "#{session_name}\t#{window_name}\t#{pane_index}\t"
+        "#{pane_current_command}\t#{pane_title}\t#{pane_active}"
+    )
+    try:
+        proc = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", fmt],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except FileNotFoundError:
+        raise FGError("tmux not found on PATH")
+    except subprocess.TimeoutExpired:
+        raise FGError("tmux discovery timed out")
+    if proc.returncode != 0:
+        raise FGError(proc.stderr.strip() or "tmux list-panes failed")
+    rows = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+        target, session, window, pane, command, title, active = parts
+        rows.append({
+            "target": target,
+            "session": session,
+            "window": window,
+            "pane": pane,
+            "command": command,
+            "title": title,
+            "active": active == "1",
+        })
+    return rows
+
+
+def _paste_tmux(target: str, text: str) -> None:
+    try:
+        subprocess.run(["tmux", "load-buffer", "-"], input=text, text=True, check=True)
+        subprocess.run(["tmux", "paste-buffer", "-t", target], check=True)
+    except FileNotFoundError:
+        raise FGError("tmux not found on PATH")
+    except subprocess.CalledProcessError as exc:
+        raise FGError(f"tmux paste failed for {target}: {exc}")
+
+
+def cmd_peers(args) -> int:
+    store = Store(Path(args.store))
+    store.require()
+
+    if args.discover:
+        rows = _tmux_discover()
+        if args.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            return 0
+        if not rows:
+            print("no tmux panes found")
+            return 0
+        print("tmux panes:")
+        for r in rows:
+            marker = "*" if r["active"] else " "
+            title = f" title={r['title']!r}" if r["title"] else ""
+            print(
+                f"  {marker} {r['target']:<14} session={r['session']:<10} "
+                f"window={r['window']:<12} cmd={r['command']}{title}"
+            )
+        print(
+            "\nAuthorize explicitly before sending, for example:\n"
+            "  fgc peers --add harley --target api-6:0.0 --sender \"Codex/api2-4\""
+        )
+        return 0
+
+    data = _load_peers(store)
+    peers = data["peers"]
+
+    if args.add:
+        name = args.add.strip()
+        if not PEER_NAME_RE.match(name):
+            raise FGError("peer name must contain only letters, numbers, '.', '_' or '-'")
+        if not args.target:
+            raise FGError("--target is required with --add")
+        if not _tmux_target_exists(args.target):
+            raise FGError(f"tmux target not found: {args.target}")
+        if args.channel:
+            data["channel"] = str(Path(args.channel).expanduser())
+        peers[name] = {
+            "target": args.target,
+            "sender": args.sender or os.environ.get("FGC_SENDER") or "fgc-agent",
+            "created_at": now_iso(),
+            "note": args.note or None,
+        }
+        _save_peers(store, data)
+        print(f"authorized peer {name}: target={args.target} sender={peers[name]['sender']}")
+        return 0
+
+    if args.remove:
+        name = args.remove.strip()
+        if name not in peers:
+            raise FGError(f"peer not configured: {name}")
+        del peers[name]
+        _save_peers(store, data)
+        print(f"removed peer {name}")
+        return 0
+
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 0
+    print(f"peer config: {_peers_path(store)}")
+    print(f"shared log:  {data.get('channel')}")
+    if not peers:
+        print("(no authorized peers)")
+        print("run `fgc peers --discover` to list tmux panes, then authorize one with --add")
+        return 0
+    print("authorized peers:")
+    for name, peer in sorted(peers.items()):
+        note = f" note={peer.get('note')!r}" if peer.get("note") else ""
+        print(f"  {name:<16} target={peer.get('target')} sender={peer.get('sender')}{note}")
+    return 0
+
+
+def cmd_send(args) -> int:
+    store = Store(Path(args.store))
+    store.require()
+    data = _load_peers(store)
+    peers = data["peers"]
+    peer = peers.get(args.peer)
+    if peer is None:
+        raise FGError(
+            f"peer not configured: {args.peer}. Run `fgc peers` to see authorized peers."
+        )
+    target = peer.get("target")
+    if not target:
+        raise FGError(f"peer {args.peer} has no tmux target")
+    if not _tmux_target_exists(target):
+        raise FGError(f"tmux target not found: {target}")
+
+    if args.message:
+        body = " ".join(args.message).strip()
+    else:
+        body = sys.stdin.read().strip()
+    if not body:
+        raise FGError("empty message")
+
+    if args.raw:
+        message = body
+    else:
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        sender = args.sender or peer.get("sender") or os.environ.get("FGC_SENDER") or "fgc-agent"
+        message = f"[{stamp}][{sender}] {body}"
+
+    if not args.no_log:
+        channel = Path(args.channel or data.get("channel") or (store.root / AI_CHANNEL_NAME))
+        channel.parent.mkdir(parents=True, exist_ok=True)
+        with open(channel, "a", encoding="utf-8") as fh:
+            fh.write(message + "\n")
+
+    # Claude Code TUI often needs pasted LF, not tmux send-keys Enter. A second
+    # LF makes submission reliable after idle / goal-complete states.
+    _paste_tmux(target, message)
+    time.sleep(float(os.environ.get("AI_SEND_INITIAL_DELAY", "0.1")))
+    _paste_tmux(target, "\n")
+    time.sleep(float(os.environ.get("AI_SEND_SUBMIT_DELAY", "0.5")))
+    _paste_tmux(target, "\n")
+    print(f"sent to {args.peer} ({target}): {message}")
+    return 0
+
+
 _AGENTS_SPEC = """\
 # AGENTS.md — fact-graph protocol
 
@@ -1675,6 +1896,9 @@ fgc doc <id>                   # read the DETAILED document of a fact/intent (wh
 fgc fact "<gist>" -t "<title>" [--doc "<detail>"]   # record a confirmed result
 fgc done <intent-id> --fact "<gist>" -t "<title>"   # finish an intent, produce a fact
 fgc hint "<message>"           # leave a note for the commander / human
+fgc peers --discover           # list tmux panes before asking the user to authorize peers
+fgc peers                      # list user-authorized peer targets from .fg/ai-peers.json
+fgc send <peer> "<message>"    # message an authorized peer via tmux + append .fg/ai-channel.txt
 ```
 
 ## three documentation layers (every node)
@@ -1690,6 +1914,10 @@ fgc hint "<message>"           # leave a note for the commander / human
 3. Stay scoped to your assigned intent unless a blocker forces otherwise.
 4. Prefer reproducible evidence: exact commands, paths, versions, error messages.
 5. Conclude your intent with `fgc done` so the commander can pick the next step.
+6. Never send messages to a tmux pane unless the user explicitly authorized it
+   and it is listed by `fgc peers` in `{store}/ai-peers.json`.
+7. For authorized peer communication, prefer `fgc send <peer> ...`; it uses the
+   reliable paste-buffer newline flow and records the message in the shared log.
 """
 
 
@@ -1760,6 +1988,44 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--creator", default="user")
     sp.add_argument("--list", action="store_true")
     sp.set_defaults(func=cmd_hint)
+
+    sp = sub.add_parser(
+        "peers",
+        help="discover tmux panes and manage user-authorized AI peers",
+        description=(
+            "List tmux panes with --discover, then explicitly authorize selected "
+            "targets with --add. fgc send refuses to message panes that are not "
+            "stored in .fg/ai-peers.json."
+        ),
+    )
+    sp.add_argument("--discover", action="store_true", help="list all tmux panes")
+    sp.add_argument("--add", metavar="NAME", default=None,
+                    help="authorize a peer name after user approval")
+    sp.add_argument("--remove", metavar="NAME", default=None, help="remove an authorized peer")
+    sp.add_argument("--target", default=None, help="tmux target for --add, e.g. api-6:0.0")
+    sp.add_argument("--sender", default=None, help="sender label used by fgc send")
+    sp.add_argument("--channel", default=None,
+                    help="shared append-only log path (default: .fg/ai-channel.txt)")
+    sp.add_argument("--note", default=None, help="optional human note about the peer")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_peers)
+
+    sp = sub.add_parser(
+        "send",
+        help="send a message to a user-authorized tmux peer",
+        description=(
+            "Send to a peer configured by `fgc peers --add`. Messages are pasted "
+            "through tmux load-buffer/paste-buffer with extra LF submits and are "
+            "also appended to the shared log unless --no-log is used."
+        ),
+    )
+    sp.add_argument("peer", help="authorized peer name")
+    sp.add_argument("message", nargs="*", help="message text; stdin is used if omitted")
+    sp.add_argument("--sender", default=None, help="override sender label for this message")
+    sp.add_argument("--channel", default=None, help="override shared log path")
+    sp.add_argument("--no-log", action="store_true", help="do not append to the shared log")
+    sp.add_argument("--raw", action="store_true", help="send body without timestamp/sender prefix")
+    sp.set_defaults(func=cmd_send)
 
     sp = sub.add_parser("show", help="show project | fact <id> | intent <id>")
     sp.add_argument("entity", choices=["project", "fact", "intent"])

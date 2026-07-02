@@ -1,10 +1,10 @@
-# fact-graph (`fgc`)
+# AI fact graph (`fgc`)
 
 **English** | [中文](README.zh-CN.md)
 
-A **fact-graph working memory for agentic work**, built to run *inside* Claude Code — no database, no server, no web UI, no dependencies beyond the Python 3 standard library.
+A **fact-graph working memory for AI agent work**, built to run inside agent terminals such as Claude Code — no database, no server, no web UI, no dependencies beyond the Python 3 standard library.
 
-Facts are nodes. Intents are edges. The graph is one JSON file per node under a project-local `.fg/`, queryable and writable via the `fgc` CLI. A `dispatch` command spawns a Sonnet sub-agent to reason / explore against the graph and write results straight back. An interactive HTML DAG view renders the whole thing and auto-refreshes.
+Facts are nodes. Intents are edges. The graph is one JSON file per node under a project-local `.fg/`, queryable and writable via the `fgc` CLI. A `dispatch` command can spawn a Sonnet sub-agent to reason / explore against the graph and write results straight back. For multi-agent work in tmux, `fgc peers` and `fgc send` provide an explicit user-authorized communication channel. An interactive HTML DAG view renders the whole thing and auto-refreshes.
 
 This is a distillation of the [StarVoya](https://github.com/N1nEmAn/StarVoya) `Star` backend idea — a ~9,600-line Python/FastAPI system with SQLite, a dispatcher loop, a container runtime, and a TypeScript TUI. Most of that weight exists to run *outside* Claude Code. **Inside Claude Code you already have the executor (Claude), the scheduler (you), and the UI (the chat).** All that's missing is the durable, queryable fact graph. That's what `fgc` provides.
 
@@ -33,6 +33,8 @@ your-project/
 │   ├── facts/{goal,f001,…}.json
 │   ├── intents/i001.json …
 │   ├── hints/
+│   ├── ai-peers.json        # optional user-authorized tmux peer targets
+│   ├── ai-channel.txt       # optional append-only peer message log
 │   └── runs/                 # dispatch execution log
 └── AGENTS.md                 # (optional) protocol for dispatched agents
 ```
@@ -64,6 +66,7 @@ fgc setup --goal "reproduce the empty-token crash" --agents
 Or from inside Claude Code: `/fgc-setup <your goal>`.
 
 After that, every turn in that project injects the current graph state, and dispatched sub-agents read/write the same memory.
+The hooks also run `date` and inject the current local time so agents have concrete time context.
 
 ## Core model
 
@@ -80,7 +83,7 @@ State is encoded in graph structure, not a state field: an intent is "ready" iff
 fgc init --goal "..."                          # create .fg/ (or use `fgc setup`)
 fgc setup --goal "..." --agents                # opt-in THIS project (graph + hooks + AGENTS.md)
 fgc status                                     # project + frontier
-fgc graph [--format mermaid|json]              # full graph
+fgc graph [--format text|json]                 # full graph
 fgc frontier                                   # ready intents only
 fgc pick [--claim] [--any]                     # next intent id
 fgc view [--serve]                             # interactive HTML DAG
@@ -92,10 +95,28 @@ fgc done i003 --fact "<result>" -t "<标题>"    # conclude + record
 fgc complete --from f005 --note "..."          # finish project
 fgc confirm i007                               # approve gated work
 fgc hint "<message>"                           # message the commander
+fgc peers --discover                           # list tmux panes before user authorization
+fgc peers --add harley --target api-6:0.0      # authorize one tmux peer
+fgc send harley "status?"                      # send via tmux + append .fg/ai-channel.txt
 fgc teardown [--purge]                         # opt-out THIS project
 ```
 
 Every fact and intent accepts a `-t/--title`: a short human label (中文 ok) shown as the node label in the graph view.
+
+### peers / send — authorized tmux peer messaging
+
+`fgc` can coordinate multiple AI agents that are already running in tmux, but it never messages a pane just because it discovered one. Peer messaging is an explicit opt-in:
+
+```bash
+fgc peers --discover
+# show the list to the user and ask which panes/agents may communicate
+
+fgc peers --add harley --target api-6:0.0 --sender "Codex/api2-4"
+fgc peers
+fgc send harley "I fixed the login build; please verify your side."
+```
+
+Authorized peers are stored in `.fg/ai-peers.json`. `fgc send` refuses unknown names, appends the message to `.fg/ai-channel.txt`, and uses tmux `load-buffer`/`paste-buffer` with extra pasted newlines so Claude Code-style TUIs submit reliably after idle or goal-complete states. Agents should read `fgc peers` before sending and should ask the user before adding or changing any peer target.
 
 ### dispatch — spawn a Sonnet agent step
 
@@ -143,6 +164,7 @@ The templates are plain markdown with `{placeholder}` substitution. Edit `templa
 - Python 3.10+ (stdlib only — `json`, `fcntl`, `http.server`, `argparse`, …)
 - A POSIX system (Linux / macOS / WSL). `fcntl.flock` is not available on Windows.
 - The `claude` CLI on PATH for `dispatch` / `auto` (Claude Code).
+- Optional: `tmux` for user-authorized multi-agent peer messaging.
 
 ## Layout
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -38,6 +39,22 @@ sys.path.insert(0, str(HERE))
 import fg  # noqa: E402
 
 DEFAULT_STORE = fg.DEFAULT_STORE
+
+
+def _date_context() -> str:
+    try:
+        proc = subprocess.run(
+            ["date"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "`date` unavailable"
+    if proc.returncode != 0:
+        msg = proc.stderr.strip() or f"`date` exited {proc.returncode}"
+        return msg
+    return proc.stdout.strip()
 
 
 def _event_cwd() -> Path:
@@ -96,6 +113,7 @@ def sessionstart() -> int:
         # quiet: no graph here, nothing to say
         return 0
     block = (
+        f"Current local time from `date`: {_date_context()}\n\n"
         "A fact-graph working memory exists in this project "
         f"({store_path}). Treat it as the source of truth for what has been "
         "confirmed vs. tried:\n"
@@ -129,6 +147,7 @@ def userpromptsubmit() -> int:
         return 0
 
     ctx = (
+        f"[time] current local time from `date`: {_date_context()}\n\n"
         "[fact-graph] current state of the working memory:\n\n"
         + _frontier_block(store_path)
         + "\n\nBefore acting on the user's request, decide: does this turn "

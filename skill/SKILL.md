@@ -1,6 +1,6 @@
 ---
 name: fgc-setup
-description: Opt-in the CURRENT project to the fact-graph working memory. Creates the local .fg/ graph, registers the SessionStart + UserPromptSubmit hooks in this project's .claude/settings.json (NOT global — other projects are untouched), and writes AGENTS.md. After setup, every turn in this project auto-injects the current graph state so Claude always knows what's confirmed vs. tried, and sub-agents (fgc dispatch) can read/write the same graph. Use when the user says "enable fact-graph here", "在这个项目用 fgc", "setup the fact graph", "init the working memory for this project", or when starting a multi-step debugging/research/audit campaign that should be tracked and resumable. This is the per-project initializer the install.sh skill exposes as a slash command.
+description: Opt-in the CURRENT project to the fact-graph working memory. Creates the local .fg/ graph, registers the SessionStart + UserPromptSubmit hooks in this project's .claude/settings.json (NOT global — other projects are untouched), and writes AGENTS.md. After setup, every turn in this project auto-injects the current graph state and current date output so Claude always knows what's confirmed vs. tried and what time it is; sub-agents (fgc dispatch) can read/write the same graph. For multi-agent tmux work, list panes with fgc peers --discover and ask the user which panes/AI peers may communicate before authorizing any target. Use when the user says "enable fact-graph here", "在这个项目用 fgc", "setup the fact graph", "init the working memory for this project", or when starting a multi-step debugging/research/audit campaign that should be tracked and resumable. This is the per-project initializer the install.sh skill exposes as a slash command.
 license: MIT
 ---
 
@@ -23,9 +23,10 @@ Run inside the target project directory. Exactly three things, all local:
    `project.json`, `facts/goal.json`, and the `intents/` `hints/` dirs.
 2. **Registers hooks** in `./.claude/settings.json` — `SessionStart` and
    `UserPromptSubmit`, both pointing at `fg-hook.py`. These inject the current
-   graph state into every turn so the model always knows the frontier. This is
-   a **project-level** settings file; the user-level `~/.claude/settings.json`
-   and every other project are completely untouched.
+   graph state and `date` output into every turn so the model always knows the
+   frontier and current local time. This is a **project-level** settings file;
+   the user-level `~/.claude/settings.json` and every other project are
+   completely untouched.
 3. **(optional) Writes `AGENTS.md`** so dispatched sub-agents learn the
    fact-graph protocol (`fgc fact`, `fgc done`, etc.).
 
@@ -43,9 +44,30 @@ fgc setup --goal "reproduce the empty-token crash" --agents
 Or, since this is a skill, the user can just type `/fgc-setup <goal>` inside
 Claude Code and Claude will run the equivalent commands.
 
+## Multi-agent tmux authorization flow
+
+If the user wants multiple AI agents to coordinate through tmux, do this after
+the normal setup:
+
+1. Run `fgc peers --discover` and show the pane list to the user.
+2. Ask which panes/agents are allowed to communicate and what names to use.
+3. Only after explicit approval, run:
+
+```bash
+fgc peers --add harley --target api-6:0.0 --sender "Codex/api2-4"
+```
+
+4. Use `fgc send harley "message"` for communication. It appends to
+   `.fg/ai-channel.txt` and uses a reliable tmux paste-buffer submit flow.
+
+Do **not** infer authorization from discovery output or from session names.
+Never send to a tmux target unless `fgc peers` shows it as authorized in this
+project's `.fg/ai-peers.json`.
+
 ## After setup
 
 - The model is reminded each session + each turn to read/maintain the graph.
+- The hooks inject current local time from `date` each session + each turn.
 - Drive it with `fgc dispatch reason` (commander proposes next work),
   `fgc dispatch <intent-id> --skip-permissions` (executor does the work),
   `fgc dispatch verify --intent <id>` (verify a result), or
